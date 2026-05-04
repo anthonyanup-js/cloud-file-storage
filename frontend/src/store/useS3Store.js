@@ -26,11 +26,10 @@ export const useS3Store = create((set, get) => ({
     _singleUpload: async (file) => {
         set({ isUploading: true, uploadProgress: 0, error: null });
         try {
-            // 1. Get signed URL from backend
+            // 1. Get signed URL from backend (no DB record created yet)
             const { data } = await axiosInstance.post("/files/upload-url", {
                 fileName: file.name,
                 contentType: file.type,
-                size: file.size,
             });
 
             // 2. Upload directly to S3 using the signed URL
@@ -44,20 +43,22 @@ export const useS3Store = create((set, get) => ({
                 },
             });
 
-            // 3. Confirm upload with actual file size
-            await axiosInstance.post("/files/confirm-upload", {
-                fileId: data.file._id,
+            // 3. Confirm upload — this creates the DB record
+            const { data: confirmedFile } = await axiosInstance.post("/files/confirm-upload", {
+                fileName: file.name,
+                key: data.key,
                 size: file.size,
+                contentType: file.type,
             });
 
             // 4. Add file to local state
             set((state) => ({
-                files: [data.file, ...state.files],
+                files: [confirmedFile, ...state.files],
                 isUploading: false,
                 uploadProgress: 100,
             }));
 
-            return data.file;
+            return confirmedFile;
         } catch (error) {
             console.error("Upload error:", error);
             set({
@@ -75,10 +76,9 @@ export const useS3Store = create((set, get) => ({
 
         let uploadId = null;
         let key = null;
-        let fileId = null;
 
         try {
-            // 1. Initiate multipart upload — get uploadId + presigned URLs
+            // 1. Initiate multipart upload — get uploadId + presigned URLs (no DB record yet)
             const { data } = await axiosInstance.post("/files/initiate-multipart", {
                 fileName: file.name,
                 contentType: file.type,
@@ -87,7 +87,6 @@ export const useS3Store = create((set, get) => ({
 
             uploadId = data.uploadId;
             key = data.key;
-            fileId = data.fileId;
             const { partUrls, totalParts } = data;
 
             // 2. Slice file and upload parts in parallel (max 5 concurrent)
@@ -134,39 +133,31 @@ export const useS3Store = create((set, get) => ({
             }
             await Promise.all(workers);
 
-            // 3. Complete the multipart upload
-            await axiosInstance.post("/files/complete-multipart", {
+            // 3. Complete the multipart upload — this creates the DB record
+            const { data: completedFile } = await axiosInstance.post("/files/complete-multipart", {
                 uploadId,
                 key,
-                fileId,
                 parts: completedParts,
+                fileName: file.name,
+                contentType: file.type,
+                size: file.size,
             });
 
-            // 4. Build file object for local state
-            const uploadedFile = {
-                _id: fileId,
-                fileName: file.name,
-                originalName: file.name,
-                key,
-                size: file.size,
-                mimeType: file.type,
-                createdAt: new Date().toISOString(),
-            };
-
+            // 4. Add confirmed file to local state
             set((state) => ({
-                files: [uploadedFile, ...state.files],
+                files: [completedFile, ...state.files],
                 isUploading: false,
                 uploadProgress: 100,
             }));
 
-            return uploadedFile;
+            return completedFile;
         } catch (error) {
             console.error("Multipart upload error:", error);
 
-            // Abort to clean up S3 parts + DB record
+            // Abort to clean up S3 parts (no DB record to clean up)
             if (uploadId && key) {
                 try {
-                    await axiosInstance.post("/files/abort-multipart", { uploadId, key, fileId });
+                    await axiosInstance.post("/files/abort-multipart", { uploadId, key });
                 } catch (abortErr) {
                     console.error("Failed to abort multipart upload:", abortErr);
                 }

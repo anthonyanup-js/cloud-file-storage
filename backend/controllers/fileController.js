@@ -17,7 +17,7 @@ const PART_SIZE = 10 * 1024 * 1024; // 10 MB
 // Generate a signed PUT URL for direct browser upload
 export const getUploadUrl = async (req, res) => {
     try {
-        const { fileName, contentType, size } = req.body;
+        const { fileName, contentType } = req.body;
 
         if (!fileName || !contentType) {
             return res.status(400).json({ message: "fileName and contentType are required" });
@@ -34,7 +34,23 @@ export const getUploadUrl = async (req, res) => {
 
         const signedUrl = await getSignedUrl(s3Client, command, { expiresIn: 300 });
 
-        // Save file metadata to MongoDB
+        // Don't save to DB yet — wait until upload is confirmed
+        res.json({ signedUrl, key });
+    } catch (error) {
+        console.error("getUploadUrl error:", error);
+        res.status(500).json({ message: "Failed to generate upload URL" });
+    }
+};
+
+// Confirm upload completed — create file record in DB only after S3 has the data
+export const confirmUpload = async (req, res) => {
+    try {
+        const { fileName, key, size, contentType } = req.body;
+
+        if (!fileName || !key) {
+            return res.status(400).json({ message: "fileName and key are required" });
+        }
+
         const file = await File.create({
             fileName,
             originalName: fileName,
@@ -43,28 +59,6 @@ export const getUploadUrl = async (req, res) => {
             mimeType: contentType,
             userId: req.user._id,
         });
-
-        res.json({ signedUrl, file });
-    } catch (error) {
-        console.error("getUploadUrl error:", error);
-        res.status(500).json({ message: "Failed to generate upload URL" });
-    }
-};
-
-// Confirm upload completed — update file size if needed
-export const confirmUpload = async (req, res) => {
-    try {
-        const { fileId, size } = req.body;
-
-        const file = await File.findOneAndUpdate(
-            { _id: fileId, userId: req.user._id },
-            { size },
-            { new: true }
-        );
-
-        if (!file) {
-            return res.status(404).json({ message: "File not found" });
-        }
 
         res.json(file);
     } catch (error) {
@@ -200,6 +194,7 @@ export const renameFile = async (req, res) => {
 // ── Multipart Upload ──────────────────────────────────────
 
 // Initiate a multipart upload — returns uploadId + presigned URLs for each part
+// Does NOT create a DB record — that happens in completeMultipartUpload
 export const initiateMultipartUpload = async (req, res) => {
     try {
         const { fileName, contentType, size } = req.body;
@@ -232,30 +227,21 @@ export const initiateMultipartUpload = async (req, res) => {
             partUrls.push({ partNumber, signedUrl });
         }
 
-        // 3. Save file metadata to MongoDB (size will be confirmed on complete)
-        const file = await File.create({
-            fileName,
-            originalName: fileName,
-            key,
-            size,
-            mimeType: contentType,
-            userId: req.user._id,
-        });
-
-        res.json({ uploadId: UploadId, fileId: file._id, key, partUrls, totalParts });
+        // No DB record yet — only created after all parts are uploaded and assembled
+        res.json({ uploadId: UploadId, key, partUrls, totalParts });
     } catch (error) {
         console.error("initiateMultipartUpload error:", error);
         res.status(500).json({ message: "Failed to initiate multipart upload" });
     }
 };
 
-// Complete a multipart upload — assembles all parts in S3
+// Complete a multipart upload — assembles all parts in S3, then creates DB record
 export const completeMultipartUpload = async (req, res) => {
     try {
-        const { uploadId, key, fileId, parts } = req.body;
+        const { uploadId, key, parts, fileName, contentType, size } = req.body;
 
-        if (!uploadId || !key || !fileId || !parts || !Array.isArray(parts)) {
-            return res.status(400).json({ message: "uploadId, key, fileId, and parts[] are required" });
+        if (!uploadId || !key || !parts || !Array.isArray(parts) || !fileName) {
+            return res.status(400).json({ message: "uploadId, key, fileName, and parts[] are required" });
         }
 
         const command = new CompleteMultipartUploadCommand({
@@ -271,11 +257,15 @@ export const completeMultipartUpload = async (req, res) => {
 
         await s3Client.send(command);
 
-        // Update file in MongoDB
-        const file = await File.findById(fileId);
-        if (!file) {
-            return res.status(404).json({ message: "File not found" });
-        }
+        // NOW create the DB record — S3 has confirmed the file is assembled
+        const file = await File.create({
+            fileName,
+            originalName: fileName,
+            key,
+            size: size || 0,
+            mimeType: contentType,
+            userId: req.user._id,
+        });
 
         res.json(file);
     } catch (error) {
@@ -284,27 +274,22 @@ export const completeMultipartUpload = async (req, res) => {
     }
 };
 
-// Abort a multipart upload — cleans up S3 parts and removes DB record
+// Abort a multipart upload — cleans up incomplete S3 parts
 export const abortMultipartUpload = async (req, res) => {
     try {
-        const { uploadId, key, fileId } = req.body;
+        const { uploadId, key } = req.body;
 
         if (!uploadId || !key) {
             return res.status(400).json({ message: "uploadId and key are required" });
         }
 
-        // Abort the S3 multipart upload
+        // Abort the S3 multipart upload (no DB record to clean up — it was never created)
         const command = new AbortMultipartUploadCommand({
             Bucket: BUCKET,
             Key: key,
             UploadId: uploadId,
         });
         await s3Client.send(command);
-
-        // Remove file metadata from MongoDB
-        if (fileId) {
-            await File.findByIdAndDelete(fileId);
-        }
 
         res.json({ message: "Multipart upload aborted" });
     } catch (error) {
